@@ -116,12 +116,15 @@ def build_basic_loader(code_addr: int, weights_addr: int, weights_len: int,
         return struct.pack(">H", line_num) + struct.pack("<H", len(line)) + line
 
     def num(n: int) -> bytes:
-        """Inline 5-byte numeric constant in BASIC."""
-        # Format: 0x0E <5 bytes float>
-        # We use integer shortcut: for small integers
+        """Number literal in tokenised BASIC: ASCII text + 0x0E marker + 5-byte value.
+        Spectrum BASIC stores numbers as their visible text followed by a hidden
+        0x0E byte and a 5-byte binary value.  Missing the text causes 'Nonsense'."""
+        text = str(n).encode("ascii")
         if 0 <= n <= 65535:
-            return bytes([0x0E, 0x00, 0x00]) + struct.pack("<H", n) + bytes([0x00])
-        return bytes([0x0E, 0x00, 0x00, 0x00, 0x00, 0x00])  # 0
+            value = bytes([0x00, 0x00]) + struct.pack("<H", n) + bytes([0x00])
+        else:
+            value = bytes(5)
+        return text + bytes([0x0E]) + value
 
     # Spectrum BASIC tokens
     BORDER     = bytes([0xE7])
@@ -326,7 +329,13 @@ class Z80Engine:
         self.lbl("entry")
         self.DI()
         self.LD_SP_nn(0xBEFF)   # Stack below activation buffers on 48k
+        self.LD_IY_nn(0x5C3A)   # ROM routines expect IY = ERR_NR system-var base
         self.EI()
+
+        # Force L mode. In the ROM's MODE variable, 0 is L mode.
+        # 0x5C41 is MODE; 0x5C3F is LIST_SP and must not be touched.
+        self.LD_A_n(0)
+        self.emit(0x32, 0x41, 0x5C)   # LD (0x5C41), A  -- MODE = L
 
         # Print banner
         self.LD_HL_nn(0)        # placeholder – will be str_banner addr
@@ -343,9 +352,12 @@ class Z80Engine:
         self.emit(0xC8)          # RET Z
         self.RST10()             # RST 0x10
         self.emit(0x23)          # INC HL
-        # JR print_str  (rel -7)
+        # JR print_str
+        # displacement = target - PC_after_JR = labels["print_str"] - (self.pos + 1)
+        # self.pos already includes CODE_BASE; using it here avoids the CODE_BASE
+        # confusion that made the old calculation land one byte before the label.
         self.emit(0x18)
-        self.code.append((-(len(self.code) - self.labels.get("print_str",0) + 2)) & 0xFF)
+        self.code.append((self.labels["print_str"] - self.pos - 1) & 0xFF)
 
     def _emit_border_flash(self):
         """Toggle border colour (visual token-gen indicator)."""
@@ -370,12 +382,49 @@ class Z80Engine:
         self.RET()
 
     def _emit_input_line(self):
-        """Read a line from keyboard using ROM channel I/O."""
+        """Read a line from keyboard into INPUT_BUF via ROM KEY_INPUT (0x10A8).
+
+        With IY initialised to the ROM system-variable base and MODE forced to
+        L-mode, KEY_INPUT should return newly accepted decoded keys directly.
+
+        RST 0x10 does not preserve IX, BC, or AF – all three are saved around it.
+        """
         self.lbl("input_line")
-        # Use Spectrum ROM lower screen editor
-        # Open channel 0 (keyboard), read line
-        # Simplified: CALL ROM line editor at 0x0F2C
-        self.emit(0xCD, 0x2C, 0x0F)   # CALL 0x0F2C  (ROM editor)
+        self.LD_IX_nn(self.INPUT_BUF)
+        self.emit(0x06, 0x00)            # LD B, 0  (char count)
+
+        # ── wait for the ROM to hand us a newly decoded key ─────────────────
+        self.lbl("iline_wait")
+        self.emit(0xCD, 0xA8, 0x10)      # CALL 0x10A8  KEY_INPUT
+        self.emit(0xD2); self.patch16("iline_wait")  # JP NC → no new key yet
+
+        self.emit(0xFE, 0x0D)           # CP 0x0D  ENTER
+        self.emit(0xCA); self.patch16("iline_done")
+
+        # Filter: printable ASCII 0x20–0x7E only.
+        # KEY_INPUT should now yield plain L-mode characters.
+        self.emit(0xFE, 0x20)           # CP 0x20
+        self.emit(0xDA); self.patch16("iline_wait")  # JP C  (< 0x20, skip)
+        self.emit(0xFE, 0x7F)           # CP 0x7F
+        self.emit(0xD2); self.patch16("iline_wait")  # JP NC (>= 0x7F, skip)
+
+        # Printable – echo then store.
+        # Save AF, BC, IX because RST 0x10 (PRINT-A) does not preserve them.
+        self.PUSH_AF()                   # save char
+        self.PUSH_BC()                   # save count
+        self.emit(0xDD, 0xE5)           # PUSH IX  (save buffer ptr)
+        self.RST10()                     # echo via ROM PRINT-A
+        self.emit(0xDD, 0xE1)           # POP IX
+        self.POP_BC()                    # restore count
+        self.POP_AF()                    # restore char in A
+        self.emit(0xDD, 0x77, 0x00)     # LD (IX+0), A
+        self.emit(0xDD, 0x23)           # INC IX
+        self.emit(0x04)                  # INC B
+        self.emit(0xC3); self.patch16("iline_wait")
+
+        self.lbl("iline_done")
+        self.emit(0xDD, 0x36, 0x00, 0x00)  # LD (IX+0), 0  null-terminate
+        self.emit(0x78)                  # LD A, B  (return count)
         self.RET()
 
     def _emit_tokenise(self):
@@ -534,14 +583,14 @@ def build_engine(weights_data: bytes, tokenizer: dict,
                        n_layers=n_layers, vocab=vocab)
 
     # Build banner strings first
+    # Note: avoid embedded \x00 bytes – print_str uses OR A / RET Z so any
+    # null in the middle of the string terminates printing early.
     banner = (
-        "\x16\x00\x00"   # AT 0,0
         "SOUL PLAYER SPECTRUM\r"
-        "25K TRANSFORMER  2 LAYERS\r"
-        "LOADED FROM TAPE\r\r"
-        "\x00"
+        "25K PARAMS  2 LAYERS\r"
+        "LOWERCASE + ENTER\r\r"
     )
-    prompt = "YOU> \x00"
+    prompt = "YOU> "
 
     # Build code in order
     engine.build()
