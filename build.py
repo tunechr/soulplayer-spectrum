@@ -318,7 +318,7 @@ class Z80Engine:
         self._emit_attention_head()
         self._emit_layer()
         self._emit_main_loop()
-        self.patch_all()
+        # patch_all() is deferred – called by build_engine after _emit_strings()
         return bytes(self.code)
 
     def _emit_entry(self):
